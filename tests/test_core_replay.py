@@ -21,6 +21,7 @@ def _event(
     student_id: str,
     payload: dict,
     plan_version: str = "P1",
+    seq: int | None = None,
 ) -> Event:
     return Event(
         event_id=event_id,
@@ -29,6 +30,7 @@ def _event(
         student_id=student_id,
         payload=payload,
         created_at=datetime.now(timezone.utc),
+        seq=seq,
     )
 
 
@@ -199,12 +201,15 @@ def test_replay_only_considers_requested_plan():
     assert state.students["S1"].confirmed_seconds == 7200
 
 
-def test_replay_up_to_event_id_reconstructs_past_state():
+def test_replay_up_to_seq_reconstructs_past_state():
+    from dataclasses import replace
+
     events = [
         _checkin("E-01", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T09:00:00+08:00"),
         _checkin("E-02", "S1", "2024-03-15T09:00:00+08:00", "2024-03-15T10:00:00+08:00"),
         _checkin("E-03", "S1", "2024-03-15T10:00:00+08:00", "2024-03-15T11:00:00+08:00"),
     ]
+    events = [replace(e, seq=i) for i, e in enumerate(events, start=1)]
     full = replay(
         events, plan_version="P1", timezone_name="Asia/Shanghai", required_seconds=0
     )
@@ -215,7 +220,7 @@ def test_replay_up_to_event_id_reconstructs_past_state():
         plan_version="P1",
         timezone_name="Asia/Shanghai",
         required_seconds=0,
-        up_to_event_id="E-02",
+        up_to_seq=2,
     )
     assert past.students["S1"].confirmed_seconds == 2 * 3600
 

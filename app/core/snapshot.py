@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +14,7 @@ from .replay import (
     explain_checkin,
     replay,
 )
+from .revisions import Revision
 
 
 @dataclass
@@ -25,6 +26,8 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    applied_revisions: list[dict[str, Any]] = field(default_factory=list)
+    event_cutoff_seq: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,7 +37,9 @@ class Snapshot:
             "required_seconds": self.required_seconds,
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
+            "event_cutoff_seq": self.event_cutoff_seq,
             "students": self.students,
+            "applied_revisions": self.applied_revisions,
         }
 
     @classmethod
@@ -47,7 +52,32 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            applied_revisions=list(data.get("applied_revisions", [])),
+            event_cutoff_seq=data.get("event_cutoff_seq"),
         )
+
+
+def _revision_to_manifest(rev: Revision) -> dict[str, Any]:
+    return {
+        "revision_id": rev.revision_id,
+        "activity_id": rev.activity_id,
+        "version": rev.version,
+        "status": rev.status.value,
+        "student_ids": (
+            None if rev.student_ids is None else sorted(rev.student_ids)
+        ),
+        "new_start_at": rev.new_start_utc.astimezone(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "new_end_at": rev.new_end_utc.astimezone(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "reason": rev.reason,
+        "approved_event_id": rev.approved_event_id,
+        "revoked_event_id": rev.revoked_event_id,
+        "approved_seq": rev.approved_seq,
+        "revoked_seq": rev.revoked_seq,
+    }
 
 
 def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
@@ -84,7 +114,9 @@ def build_snapshot(
     required_seconds: int,
     freeze_id: str | None = None,
     event_cutoff_id: str | None = None,
+    event_cutoff_seq: int | None = None,
     generated_at: datetime | None = None,
+    revisions: list[Revision] | None = None,
 ) -> Snapshot:
     """执行确定性的业务处理。"""
     state: ReplayState = replay(
@@ -92,7 +124,8 @@ def build_snapshot(
         plan_version=plan_version,
         timezone_name=timezone_name,
         required_seconds=required_seconds,
-        up_to_event_id=event_cutoff_id,
+        up_to_seq=event_cutoff_seq,
+        revisions=revisions,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
@@ -110,7 +143,9 @@ def build_snapshot(
         required_seconds=required_seconds,
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
         event_cutoff_id=event_cutoff_id,
+        event_cutoff_seq=event_cutoff_seq,
         students=students,
+        applied_revisions=[_revision_to_manifest(r) for r in state.applied_revisions],
     )
 
 

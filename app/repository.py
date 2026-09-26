@@ -5,13 +5,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from app.core.revisions import Revision, RevisionStatus
+
 from .core.replay import Event as CoreEvent
 from .core.replay import EventType
-from .models import Event as EventModel
+from .models import ActivityRevision, Event as EventModel
 from .models import Freeze, Plan
 
 
@@ -53,6 +55,7 @@ def _to_core_event(row: EventModel) -> CoreEvent:
         student_id=row.student_id,
         payload=dict(row.payload),
         created_at=row.created_at,
+        seq=row.id,
     )
 
 
@@ -114,6 +117,19 @@ def max_event_id(db: Session, plan_version: str) -> str | None:
     return db.execute(stmt).scalar_one_or_none()
 
 
+def last_event_seq(db: Session, plan_version: str) -> int | None:
+    """事件流末尾的单调序号（含签到与修订生命周期事件）。"""
+    stmt = select(func.max(EventModel.id)).where(
+        EventModel.plan_version == plan_version
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def event_id_at_seq(db: Session, seq: int) -> str | None:
+    row = db.get(EventModel, seq)
+    return row.event_id if row is not None else None
+
+
 def get_freeze(
     db: Session, plan_version: str, freeze_id: str
 ) -> Freeze | None:
@@ -143,3 +159,178 @@ def insert_freeze(
     if inserted is not None:
         return db.get(Freeze, (plan_version, freeze_id))
     return None
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _revision_to_core(row: ActivityRevision) -> Revision:
+    detail = dict(row.detail)
+    student_ids = detail.get("student_ids")
+    return Revision(
+        revision_id=row.revision_id,
+        plan_version=row.plan_version,
+        activity_id=row.activity_id,
+        version=row.version,
+        new_start_utc=_parse_iso(detail["new_start_at"]),
+        new_end_utc=_parse_iso(detail["new_end_at"]),
+        student_ids=None if student_ids is None else frozenset(student_ids),
+        reason=str(detail.get("reason", "")),
+        status=RevisionStatus(row.status),
+        created_by=row.created_by,
+        approved_by=row.approved_by,
+        revoked_by=row.revoked_by,
+        created_at=row.created_at,
+        approved_at=row.approved_at,
+        revoked_at=row.revoked_at,
+        approved_event_id=row.approved_event_id,
+        revoked_event_id=row.revoked_event_id,
+        approved_seq=row.approved_seq,
+        revoked_seq=row.revoked_seq,
+    )
+
+
+def next_revision_version(db: Session, plan_version: str, activity_id: str) -> int:
+    stmt = select(func.max(ActivityRevision.version)).where(
+        ActivityRevision.plan_version == plan_version,
+        ActivityRevision.activity_id == activity_id,
+    )
+    current = db.execute(stmt).scalar_one_or_none()
+    return (current or 0) + 1
+
+
+def insert_revision(
+    db: Session,
+    *,
+    plan_version: str,
+    revision_id: str,
+    activity_id: str,
+    version: int,
+    detail: dict[str, Any],
+    created_by: str,
+) -> ActivityRevision | None:
+    """插入草拟修订；revision_id 冲突时返回 None（幂等草拟）。"""
+    stmt = sqlite_insert(ActivityRevision).values(
+        plan_version=plan_version,
+        revision_id=revision_id,
+        activity_id=activity_id,
+        version=version,
+        detail=detail,
+        status=RevisionStatus.DRAFT.value,
+        created_by=created_by,
+    )
+    stmt = stmt.on_conflict_do_nothing(
+        index_elements=["plan_version", "revision_id"]
+    ).returning(ActivityRevision.id)
+    inserted = db.execute(stmt).scalar_one_or_none()
+    db.commit()
+    if inserted is None:
+        return None
+    return get_revision(db, plan_version, revision_id)
+
+
+def get_revision(
+    db: Session, plan_version: str, revision_id: str
+) -> ActivityRevision | None:
+    stmt = select(ActivityRevision).where(
+        ActivityRevision.plan_version == plan_version,
+        ActivityRevision.revision_id == revision_id,
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def list_revisions(
+    db: Session, plan_version: str, activity_id: str | None = None
+) -> list[ActivityRevision]:
+    stmt = select(ActivityRevision).where(
+        ActivityRevision.plan_version == plan_version
+    )
+    if activity_id is not None:
+        stmt = stmt.where(ActivityRevision.activity_id == activity_id)
+    stmt = stmt.order_by(
+        ActivityRevision.activity_id, ActivityRevision.version, ActivityRevision.revision_id
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def load_revisions(db: Session, plan_version: str) -> list[Revision]:
+    return [_revision_to_core(r) for r in list_revisions(db, plan_version)]
+
+
+def next_lifecycle_event_id(db: Session, kind: str, revision_id: str) -> tuple[str, int]:
+    """分配按事件流插入顺序单调递增的生命周期事件 ID 与序号。
+
+    调用方必须已在同一事务中执行条件 UPDATE（SQLite 下该写语句已获取
+    写锁），因此 max(id)+1 与随后的 INSERT 在写串行化下是稳定的。序号
+    零填充进事件 ID，使字典序与插入顺序一致。
+    """
+    current = db.execute(select(func.max(EventModel.id))).scalar_one_or_none()
+    seq = (current or 0) + 1
+    return f"REV-{seq:012d}-{kind.upper()}-{revision_id}", seq
+
+
+def transition_revision(
+    db: Session,
+    *,
+    plan_version: str,
+    revision_id: str,
+    from_status: str,
+    to_status: str,
+    kind: str,
+    actor: str | None,
+    acted_at: datetime,
+    payload: dict[str, Any],
+) -> tuple[bool, str | None, int | None]:
+    """条件状态迁移；仅当当前状态等于 from_status 时成功（并发安全）。
+
+    生命周期事件与状态更新在同一事务提交：条件 UPDATE 的行计数决定唯一
+    赢家。返回 (是否成功, 生命周期事件 ID, 事件序号)。
+    """
+    stmt = (
+        update(ActivityRevision)
+        .where(ActivityRevision.plan_version == plan_version)
+        .where(ActivityRevision.revision_id == revision_id)
+        .where(ActivityRevision.status == from_status)
+    )
+    values: dict[str, Any] = {"status": to_status}
+    if to_status == RevisionStatus.APPROVED.value:
+        values["approved_by"] = actor
+        values["approved_at"] = acted_at
+    elif to_status == RevisionStatus.REVOKED.value:
+        values["revoked_by"] = actor
+        values["revoked_at"] = acted_at
+    result = db.execute(stmt.values(**values))
+    if result.rowcount != 1:
+        db.rollback()
+        return False, None, None
+
+    lifecycle_event_id, seq = next_lifecycle_event_id(db, kind, revision_id)
+    if to_status == RevisionStatus.APPROVED.value:
+        values = {"approved_event_id": lifecycle_event_id, "approved_seq": seq}
+    else:
+        values = {"revoked_event_id": lifecycle_event_id, "revoked_seq": seq}
+    db.execute(
+        update(ActivityRevision)
+        .where(ActivityRevision.plan_version == plan_version)
+        .where(ActivityRevision.revision_id == revision_id)
+        .values(**values)
+    )
+
+    db.execute(
+        sqlite_insert(EventModel)
+        .values(
+            event_id=lifecycle_event_id,
+            plan_version=plan_version,
+            student_id="",
+            event_type=(
+                "revision_approve"
+                if kind.upper() == "APPROVE"
+                else "revision_revoke"
+            ),
+            payload=payload,
+        )
+        .on_conflict_do_nothing(index_elements=["event_id", "plan_version"])
+    )
+    db.commit()
+    return True, lifecycle_event_id, seq
