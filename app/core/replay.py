@@ -5,15 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .clock import (
     academic_day,
     elapsed_seconds,
+    format_utc,
     merge_intervals,
     split_by_academic_day,
     to_utc,
     union_seconds,
+)
+from .revisions import (
+    ActivityRevision,
+    effective_revision_map,
+    fold_activity_revisions,
 )
 
 
@@ -21,6 +27,7 @@ class EventType(StrEnum):
     CHECKIN = "checkin"
     MENTOR_CONFIRM = "mentor_confirm"
     LEAVE_CORRECTION = "leave_correction"
+    ACTIVITY_REVISION = "activity_revision"
 
 
 class CheckinStatus(StrEnum):
@@ -52,6 +59,9 @@ class CheckinRecord:
     start_utc: datetime
     end_utc: datetime
     status: CheckinStatus
+    original_start_utc: datetime | None = None
+    original_end_utc: datetime | None = None
+    applied_revision_id: str | None = None
 
     @property
     def seconds(self) -> int:
@@ -97,13 +107,20 @@ class ReplayState:
     timezone: str
     required_seconds: int
     students: dict[str, StudentProgress]
+    revisions: dict[str, list[ActivityRevision]] = field(default_factory=dict)
 
 
 def _parse_checkin(
-    event: Event, tz_name: str
+    event: Event, tz_name: str, revision: ActivityRevision | None = None
 ) -> CheckinRecord:
     start = to_utc(datetime.fromisoformat(event.payload["check_in_at"]))
     end = to_utc(datetime.fromisoformat(event.payload["check_out_at"]))
+    original_start, original_end = start, end
+    applied_revision_id: str | None = None
+    if revision is not None and event.student_id not in revision.exempt_student_ids:
+        # 应用活动时间修订：有效区间取修订后的起止时间，原始签到保持不变。
+        start, end = revision.start_utc, revision.end_utc
+        applied_revision_id = revision.revision_id
     activity_type = event.payload.get("activity_type", "regular")
     requires_confirmation = activity_type == INTERNSHIP_TYPE
     status = (
@@ -117,6 +134,9 @@ def _parse_checkin(
         start_utc=start,
         end_utc=end,
         status=status,
+        original_start_utc=original_start,
+        original_end_utc=original_end,
+        applied_revision_id=applied_revision_id,
     )
 
 
@@ -127,6 +147,7 @@ def replay(
     timezone_name: str,
     required_seconds: int,
     up_to_event_id: str | None = None,
+    revision_overrides: Mapping[str, ActivityRevision] | None = None,
 ) -> ReplayState:
     """执行确定性的业务处理。"""
     sorted_events = sorted(
@@ -136,13 +157,22 @@ def replay(
     if up_to_event_id is not None:
         sorted_events = [e for e in sorted_events if e.event_id <= up_to_event_id]
 
+    # 第一遍：折叠活动时间修订事件，确定每个活动的有效版本。
+    revisions_by_activity = fold_activity_revisions(sorted_events)
+    effective_revisions = effective_revision_map(revisions_by_activity)
+    if revision_overrides:
+        effective_revisions = {**effective_revisions, **revision_overrides}
+
     checkins_by_student: dict[str, list[CheckinRecord]] = {}
     checkin_index: dict[str, CheckinRecord] = {}
     adjustments_by_student: dict[str, list[Adjustment]] = {}
 
     for event in sorted_events:
         if event.event_type == EventType.CHECKIN:
-            record = _parse_checkin(event, timezone_name)
+            activity_id = event.payload.get("activity_id", "")
+            record = _parse_checkin(
+                event, timezone_name, effective_revisions.get(activity_id)
+            )
             checkins_by_student.setdefault(event.student_id, []).append(record)
             checkin_index[event.event_id] = record
         elif event.event_type == EventType.MENTOR_CONFIRM:
@@ -216,12 +246,15 @@ def replay(
         timezone=timezone_name,
         required_seconds=required_seconds,
         students=students,
+        revisions=revisions_by_activity,
     )
 
 
 def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
     """执行确定性的业务处理。"""
     segments = split_by_academic_day(record.start_utc, record.end_utc, tz_name)
+    original_start = record.original_start_utc or record.start_utc
+    original_end = record.original_end_utc or record.end_utc
     return {
         "event_id": record.event_id,
         "activity_id": record.activity_id,
@@ -234,6 +267,9 @@ def explain_checkin(record: CheckinRecord, tz_name: str) -> dict[str, Any]:
         "check_out_at_utc": record.end_utc.astimezone(timezone.utc)
         .isoformat()
         .replace("+00:00", "Z"),
+        "original_check_in_at_utc": format_utc(original_start),
+        "original_check_out_at_utc": format_utc(original_end),
+        "applied_revision_id": record.applied_revision_id,
         "raw_seconds": record.seconds,
         "academic_days": [
             {

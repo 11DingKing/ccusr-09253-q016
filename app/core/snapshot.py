@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +14,7 @@ from .replay import (
     explain_checkin,
     replay,
 )
+from .revisions import revision_to_dict
 
 
 @dataclass
@@ -25,6 +26,7 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    activity_revisions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +37,7 @@ class Snapshot:
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
             "students": self.students,
+            "activity_revisions": self.activity_revisions,
         }
 
     @classmethod
@@ -47,6 +50,7 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            activity_revisions=list(data.get("activity_revisions", [])),
         )
 
 
@@ -102,6 +106,11 @@ def build_snapshot(
         _student_to_dict(state.students[sid], timezone_name)
         for sid in sorted(state.students)
     ]
+    activity_revisions = [
+        revision_to_dict(revision)
+        for activity_id in sorted(state.revisions)
+        for revision in state.revisions[activity_id]
+    ]
 
     return Snapshot(
         plan_version=plan_version,
@@ -111,6 +120,7 @@ def build_snapshot(
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
         event_cutoff_id=event_cutoff_id,
         students=students,
+        activity_revisions=activity_revisions,
     )
 
 

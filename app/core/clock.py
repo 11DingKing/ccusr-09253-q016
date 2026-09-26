@@ -101,3 +101,31 @@ def union_seconds(intervals: list[tuple[datetime, datetime]]) -> int:
     for start, end in merge_intervals(intervals):
         total += elapsed_seconds(start, end)
     return total
+
+
+def intersect_intervals(
+    first: list[tuple[datetime, datetime]],
+    second: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """计算两组区间的重叠部分，返回合并后的交集区间。"""
+    merged_first = merge_intervals(first)
+    merged_second = merge_intervals(second)
+    overlaps: list[tuple[datetime, datetime]] = []
+    i = j = 0
+    while i < len(merged_first) and j < len(merged_second):
+        start = max(merged_first[i][0], merged_second[j][0])
+        end = min(merged_first[i][1], merged_second[j][1])
+        if start < end:
+            overlaps.append((start, end))
+        if merged_first[i][1] < merged_second[j][1]:
+            i += 1
+        else:
+            j += 1
+    return overlaps
+
+
+def format_utc(moment_utc: datetime) -> str:
+    """以 RFC 3339 `Z` 形式输出 UTC 时间。"""
+    return (
+        to_utc(moment_utc).isoformat().replace("+00:00", "Z")
+    )

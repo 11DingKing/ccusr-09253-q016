@@ -51,7 +51,9 @@ class LeaveCorrectionPayload(BaseModel):
 
 class EventIn(BaseModel):
     event_id: str = Field(..., min_length=1, max_length=128)
-    event_type: Literal["checkin", "mentor_confirm", "leave_correction"]
+    event_type: Literal[
+        "checkin", "mentor_confirm", "leave_correction", "activity_revision"
+    ]
     student_id: str = Field(..., min_length=1, max_length=128)
     payload: dict[str, Any]
 
@@ -90,6 +92,10 @@ class CheckinExplanation(BaseModel):
     counts: bool
     check_in_at_utc: str
     check_out_at_utc: str
+    # 旧冻结快照可能缺少以下溯源字段，故提供默认值。
+    original_check_in_at_utc: str | None = None
+    original_check_out_at_utc: str | None = None
+    applied_revision_id: str | None = None
     raw_seconds: int
     academic_days: list[dict[str, Any]]
 
@@ -122,6 +128,7 @@ class SnapshotOut(BaseModel):
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    activity_revisions: list[dict[str, Any]] = []
 
 
 class FreezeIn(BaseModel):
@@ -138,3 +145,90 @@ class DiffOut(BaseModel):
     new_event_cutoff_id: str | None
     student_changes: list[dict[str, Any]]
     students_affected: int
+
+
+class ActivityRevisionDraftIn(BaseModel):
+    revision_id: str = Field(..., min_length=1, max_length=64)
+    check_in_at: datetime
+    check_out_at: datetime
+    exempt_student_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+    @field_validator("revision_id")
+    @classmethod
+    def _revision_id_charset(cls, v: str) -> str:
+        if "#" in v or not v.strip():
+            raise ValueError("revision_id must be non-blank and must not contain '#'")
+        return v
+
+    @field_validator("check_in_at", "check_out_at")
+    @classmethod
+    def _ensure_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamps must be timezone-aware (RFC 3339)")
+        return v
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "ActivityRevisionDraftIn":
+        if self.check_out_at <= self.check_in_at:
+            raise ValueError("check_out_at must be after check_in_at")
+        return self
+
+
+class RevisionActionIn(BaseModel):
+    reason: str = ""
+
+
+class ActivityRevisionOut(BaseModel):
+    plan_version: str
+    activity_id: str
+    revision_id: str
+    status: str
+    effective: bool
+    check_in_at_utc: str
+    check_out_at_utc: str
+    exempt_student_ids: list[str]
+    reason: str
+    drafted_event_id: str
+    approved_event_id: str | None
+    revoked_event_id: str | None
+
+
+class ActivityRevisionListOut(BaseModel):
+    plan_version: str
+    activity_id: str
+    effective_revision_id: str | None
+    revisions: list[ActivityRevisionOut]
+
+
+class IntervalOut(BaseModel):
+    start_utc: str
+    end_utc: str
+    seconds: int
+
+
+class RevisionImpactStudentOut(BaseModel):
+    student_id: str
+    exempt: bool
+    affected: bool
+    before_intervals: list[IntervalOut]
+    after_intervals: list[IntervalOut]
+    overlap_intervals: list[IntervalOut]
+    before_seconds: int
+    after_seconds: int
+    delta_seconds: int
+    daily_before: list[DailyTotal]
+    daily_after: list[DailyTotal]
+    total_seconds_before: int
+    total_seconds_after: int
+
+
+class RevisionImpactOut(BaseModel):
+    plan_version: str
+    activity_id: str
+    revision_id: str
+    revision_status: str
+    currently_effective: bool
+    candidate: dict[str, Any]
+    affected_students: int
+    students: list[RevisionImpactStudentOut]

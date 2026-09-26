@@ -19,3 +19,15 @@ python3 -m compileall -q app tests
 ```
 
 测试覆盖事件幂等导入、跨时区与跨日学时合并、实习确认、负向修正、冻结快照和差异查询；运行过程中不需要单独的数据库或网络服务。
+
+## 活动时间修订
+
+活动组织方可整体更正一场实训的起止时间，无需逐个重写学生签到。修订以 `activity_revision` 事件（`draft` / `approve` / `revoke` 三种动作）追加到事件流；重放内核先折叠出每个活动的修订状态机（`draft → approved → superseded / revoked`），再在解释签到时应用当前有效版本——最新已批准且未撤销的修订生效，撤销后回退到上一份已批准版本，原始签到事件始终不变。已冻结快照按冻结时的事件截止保留当时版本，新冻结自动采用最新已批准修订，并在快照中记录所用修订版本以便审计。
+
+业务接口（均位于 `/api/plans/{plan_version}/activities/{activity_id}/revisions` 下）：
+
+- `POST /` 草拟修订（可指定 `exempt_student_ids` 豁免个别学生，保留其实际签到）；
+- `GET /` 与 `GET /{revision_id}` 版本查询，返回各修订状态与当前有效版本；
+- `GET /{revision_id}/impact` 影响预览：假设该修订生效，计算受影响学生、新旧区间重叠部分、按教学日的归属变化与总学时变化；
+- `POST /{revision_id}/approve` 审批（幂等，并发审批同一草稿只记录一条审批事件；多份修订竞争审批时按事件顺序确定生效者）；
+- `POST /{revision_id}/revoke` 撤销（草稿撤回或回退已批准修订）。
